@@ -14,6 +14,7 @@ import {
   type LearnedRoutingOutcome,
   type LearnedRoutingPattern,
 } from '../services/learned-routing.js';
+import { applyTypesafeRouting, getTypesafeRouter } from '../ruvector/typesafe-router.js';
 
 // Real vector search functions - lazy loaded to avoid circular imports
 let searchEntriesFn: ((options: {
@@ -324,6 +325,12 @@ const TASK_PATTERNS: Record<string, RoutingPattern> = {
     agents: ['memory-specialist', 'architect', 'coder'],
   },
 };
+
+/** Wrap hooks_route so the opt-in typesafe router (src/ruvector/typesafe-router.ts) can override the legacy pick. */
+function withTypesafeRouting(legacy: (params: Record<string, unknown>) => Promise<object>) {
+  return async (params: Record<string, unknown>) =>
+    applyTypesafeRouting(params, (await legacy(params)) as Record<string, unknown>, TASK_PATTERNS, getTypesafeRouter());
+}
 
 /**
  * Get the semantic router with environment detection.
@@ -779,12 +786,22 @@ function suggestAgentsForFile(filePath: string): string[] {
   return AGENT_PATTERNS[ext] || ['coder', 'architect'];
 }
 
-function suggestAgentsForTask(task: string): { agents: string[]; confidence: number } {
-  const taskLower = task.toLowerCase();
+// Whole-word matchers for KEYWORD_PATTERNS. A bare `includes()` matched
+// substrings: 'test' hit "latest" (tester @ 0.95), 'auth' hit "author",
+// 'fix' hit "prefix", 'api' hit "capitalize". Single words get \b anchors plus
+// simple inflections (tests, testing, fixes, deployed); phrases containing
+// whitespace or '/' (e.g. 'ci/cd') match literally between word boundaries.
+const KEYWORD_MATCHERS = Object.entries(KEYWORD_PATTERNS).map(([keyword, result]) => {
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const body = /[\s/]/.test(keyword) ? escaped : `${escaped}(?:s|es|ing|ed)?`;
+  return { regex: new RegExp(`\\b${body}\\b`, 'i'), result };
+});
 
+/** Exported for tests. */
+export function suggestAgentsForTask(task: string): { agents: string[]; confidence: number } {
   // Check static keyword patterns first
-  for (const [pattern, result] of Object.entries(KEYWORD_PATTERNS)) {
-    if (taskLower.includes(pattern)) {
+  for (const { regex, result } of KEYWORD_MATCHERS) {
+    if (regex.test(task)) {
       return result;
     }
   }
@@ -1116,7 +1133,8 @@ export const hooksRoute: MCPTool = {
     },
     required: ['task'],
   },
-  handler: async (params: Record<string, unknown>) => {
+  // Opt-in @ruvector/typesafe augmentation (CLAUDE_FLOW_ROUTER_TYPESAFE=1); returns the legacy result unchanged when unset.
+  handler: withTypesafeRouting(async (params: Record<string, unknown>) => {
     const task = params.task as string;
     const context = params.context as string | undefined;
     const useSemanticRouter = params.useSemanticRouter !== false;
@@ -1296,7 +1314,7 @@ export const hooksRoute: MCPTool = {
         coordination: 'queen-led',
       } : null,
     };
-  },
+  }),
 };
 
 export const hooksMetrics: MCPTool = {
@@ -1597,13 +1615,15 @@ export const hooksPostTask: MCPTool = {
       // Non-fatal
     }
 
-    // Record trajectory via intelligence module (SONA + ReasoningBank)
+    // Record trajectory via intelligence module (SONA + ReasoningBank).
+    // #3353: keep the observed result instead of discarding it.
+    let trajectoryRecorded = false;
     try {
       const intelligence = await import('../memory/intelligence.js');
-      await intelligence.recordTrajectory(
+      trajectoryRecorded = (await intelligence.recordTrajectory(
         [{ type: 'result' as const, content: (params.task as string) || taskId, metadata: { success, agent, quality }, timestamp: Date.now() }],
         success ? 'success' : 'failure'
-      );
+      )) === true;
     } catch {
       // Intelligence module not available — non-fatal
     }
@@ -1741,17 +1761,32 @@ export const hooksPostTask: MCPTool = {
       writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf-8');
     } catch { /* non-critical */ }
 
+    // #3353: report only observed learning results. The previous
+    // `feedbackResult?.updated || (success ? 2 : 1)` / `newPatterns: success ? 1 : 0`
+    // invented counts whenever the feedback controller was unavailable (and the
+    // `||` turned an observed 0 into 2). No path reports pattern *creation*, so
+    // newPatterns is null (unknown) rather than a guess; the trajectory has no
+    // real id to surface, so trajectoryId is null.
+    const feedbackRecorded = feedbackResult?.success === true;
+    const learningAvailable = feedbackRecorded;
     return {
       taskId,
       success,
       duration,
       learningUpdates: {
-        patternsUpdated: feedbackResult?.updated || (success ? 2 : 1),
-        newPatterns: success ? 1 : 0,
-        trajectoryId: `traj-${Date.now()}`,
+        patternsUpdated: feedbackRecorded ? (feedbackResult?.updated ?? 0) : 0,
+        newPatterns: null as number | null,
+        trajectoryId: null as string | null,
         controller: feedbackResult?.controller || 'none',
         outcomePersisted,
+        available: learningAvailable,
+        ...(learningAvailable ? {} : {
+          reason: feedbackResult
+            ? `feedback controller '${feedbackResult.controller}' did not record the outcome`
+            : 'feedback controller unavailable',
+        }),
       },
+      trajectory: { recorded: trajectoryRecorded },
       quality,
       pheromone,
       feedback: feedbackResult ? {
